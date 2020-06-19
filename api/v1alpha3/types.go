@@ -118,8 +118,11 @@ const (
 
 // IngressRule defines an Azure ingress rule for security groups.
 type IngressRule struct {
-	Description string                `json:"description"`
+	Name        *string               `json:"name"`
+	Description *string               `json:"description"`
 	Protocol    SecurityGroupProtocol `json:"protocol"`
+
+	Priority *int32 `json:"priority,omitempty"`
 
 	// SourcePorts - The source port or range. Integer or range between 0 and 65535. Asterix '*' can also be used to match all ports.
 	SourcePorts *string `json:"sourcePorts,omitempty"`

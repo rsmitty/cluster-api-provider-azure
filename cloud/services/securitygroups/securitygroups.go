@@ -25,6 +25,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/to"
 	"github.com/pkg/errors"
 	"k8s.io/klog"
+	infrav1 "sigs.k8s.io/cluster-api-provider-azure/api/v1alpha3"
 	azure "sigs.k8s.io/cluster-api-provider-azure/cloud"
 )
 
@@ -62,33 +63,64 @@ func (s *Service) Reconcile(ctx context.Context, spec interface{}) error {
 		securityRules = *securityGroup.SecurityRules
 	}
 
-	defaultRules := make(map[string]network.SecurityRule, 0)
-	defaultRules[sshRule] = getRule("allow_ssh", "22", 100)
-	defaultRules[apiServerRule] = getRule("allow_6443", strconv.Itoa(int(s.Scope.APIServerPort())), 101)
+	sshIngress := infrav1.IngressRule{
+		Name:             to.StringPtr("allow_ssh"),
+		Description:      to.StringPtr("Allow SSH"),
+		Priority:         to.Int32Ptr(100),
+		SourcePorts:      to.StringPtr("*"),
+		DestinationPorts: to.StringPtr("22"),
+		Source:           to.StringPtr("*"),
+		Destination:      to.StringPtr("*"),
+	}
 
+	apiServerIngress := infrav1.IngressRule{
+		Name:             to.StringPtr("allow_6443"),
+		Description:      to.StringPtr("Allow 6443"),
+		Priority:         to.Int32Ptr(101),
+		SourcePorts:      to.StringPtr("*"),
+		DestinationPorts: to.StringPtr(strconv.Itoa(int(s.Scope.APIServerPort()))),
+		Source:           to.StringPtr("*"),
+		Destination:      to.StringPtr("*"),
+	}
+
+	defaultRules := make(map[string]network.SecurityRule, 0)
+	defaultRules[sshRule] = getRule(sshIngress)
+	defaultRules[apiServerRule] = getRule(apiServerIngress)
+
+	// Fetch any specified ingress rules from subnet spec
 	if nsgSpec.IsControlPlane {
-		if nsgExists {
-			// Check if the expected rules are present
-			update := false
-			for _, rule := range defaultRules {
-				if !ruleExists(securityRules, rule) {
-					update = true
-					securityRules = append(securityRules, rule)
-				}
-			}
-			if !update {
-				// Skip update for control-plane NSG as the required default rules are present
-				klog.V(2).Infof("security group %s exists and no default rules are missing, skipping update", nsgSpec.Name)
-				return nil
-			}
-		} else {
-			klog.V(2).Infof("applying missing default rules for control plane NSG %s", nsgSpec.Name)
-			securityRules = append(securityRules, defaultRules[sshRule], defaultRules[apiServerRule])
+		// Add any specifed ingressrules from controlplane security group spec
+		cpSubnet := s.Scope.ControlPlaneSubnet()
+		for _, ingressRule := range cpSubnet.SecurityGroup.IngressRules {
+			defaultRules[*ingressRule.Name] = getRule(*ingressRule)
 		}
-	} else if nsgExists {
-		// Skip update for node NSG as no default rules are required
-		klog.V(2).Infof("security group %s exists and no default rules are required, skipping update", nsgSpec.Name)
-		return nil
+	} else {
+		// Add any specifed ingressrules from node security group spec
+		nodeSubnet := s.Scope.NodeSubnet()
+		for _, ingressRule := range nodeSubnet.SecurityGroup.IngressRules {
+			defaultRules[*ingressRule.Name] = getRule(*ingressRule)
+		}
+	}
+
+	if nsgExists {
+		// Check if the expected rules are present
+		update := false
+		for _, rule := range defaultRules {
+			if !ruleExists(securityRules, rule) {
+				update = true
+				securityRules = append(securityRules, rule)
+			}
+		}
+		if !update {
+			// Skip update for control-plane NSG as the required default rules are present
+			klog.V(2).Infof("security group %s exists and no default rules are missing, skipping update", nsgSpec.Name)
+			return nil
+		}
+	} else {
+		klog.V(2).Infof("applying missing default rules for control plane NSG %s", nsgSpec.Name)
+		for _, rule := range defaultRules {
+			securityRules = append(securityRules, rule)
+		}
 	}
 
 	sg := network.SecurityGroup{
@@ -134,21 +166,48 @@ func ruleExists(rules []network.SecurityRule, rule network.SecurityRule) bool {
 	return false
 }
 
-func getRule(name, destinationPort string, priority int32) network.SecurityRule {
-	return network.SecurityRule{
-		Name: to.StringPtr(name),
+func getRule(ingress infrav1.IngressRule) network.SecurityRule {
+	secRule := network.SecurityRule{
+		Name: ingress.Name,
 		SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
 			Protocol:                 network.SecurityRuleProtocolTCP,
-			SourceAddressPrefix:      to.StringPtr("*"),
-			SourcePortRange:          to.StringPtr("*"),
-			DestinationAddressPrefix: to.StringPtr("*"),
-			DestinationPortRange:     to.StringPtr(destinationPort),
+			SourceAddressPrefix:      ingress.Source,
+			SourcePortRange:          ingress.SourcePorts,
+			DestinationAddressPrefix: ingress.Destination,
+			DestinationPortRange:     ingress.DestinationPorts,
 			Access:                   network.SecurityRuleAccessAllow,
 			Direction:                network.SecurityRuleDirectionInbound,
-			Priority:                 to.Int32Ptr(priority),
+			Priority:                 ingress.Priority,
 		},
 	}
+
+	switch ingress.Protocol {
+	case infrav1.SecurityGroupProtocolAll:
+		secRule.SecurityRulePropertiesFormat.Protocol = network.SecurityRuleProtocolAsterisk
+	case infrav1.SecurityGroupProtocolTCP:
+		secRule.SecurityRulePropertiesFormat.Protocol = network.SecurityRuleProtocolTCP
+	case infrav1.SecurityGroupProtocolUDP:
+		secRule.SecurityRulePropertiesFormat.Protocol = network.SecurityRuleProtocolUDP
+	}
+
+	return secRule
 }
+
+// func getRule(name, destinationPort string, priority int32) network.SecurityRule {
+// 	return network.SecurityRule{
+// 		Name: to.StringPtr(name),
+// 		SecurityRulePropertiesFormat: &network.SecurityRulePropertiesFormat{
+// 			Protocol:                 network.SecurityRuleProtocolTCP,
+// 			SourceAddressPrefix:      to.StringPtr("*"),
+// 			SourcePortRange:          to.StringPtr("*"),
+// 			DestinationAddressPrefix: to.StringPtr("*"),
+// 			DestinationPortRange:     to.StringPtr(destinationPort),
+// 			Access:                   network.SecurityRuleAccessAllow,
+// 			Direction:                network.SecurityRuleDirectionInbound,
+// 			Priority:                 to.Int32Ptr(priority),
+// 		},
+// 	}
+// }
 
 // Delete deletes the network security group with the provided name.
 func (s *Service) Delete(ctx context.Context, spec interface{}) error {
